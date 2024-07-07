@@ -42,6 +42,8 @@ Last, but not least, you'll have to map the permissions to the created group. To
 
 To install the dependecies for the script, you'll have to run `pip install -r requirements.txt`.
 
+As per requirements on the managed VMs, the package `yum-utils` has to be installed on Red Hat based systems to enable checking for pending reboots. Also the commad `which` has to be present. On Debian based systems this should be provided by the `debianutils` package. On Red Hat based systems it's the package `which`. A Check for this has not been implemented, so it's up to the user to make sure the required packages are installed.
+
 ## Usage
 
 To use the script, you'll first have to create an inventory file. The file structure has to be as follows:
@@ -79,11 +81,41 @@ To run the script, simply execute `python3 patchmanagement.py`.
 
 If you use a self signed (and therefore untrusted) certificate for your Proxmox instance and the SSL verification warnings annoy you, you can simply add `-W ignore` to the command to supress these warnings.
 
+If you don't want to set environment variables, I provided a [wrapper](wrapper.sh) script that reads a config file, exports them to your environment and then executes the patchmanagement script.
+
+To execute the script manually simply make the script executable with `chmod +x wrapper.sh`, create a file containing all desired config variables like this:
+
+```
+PROXMOX_HOST="pve.example.com"
+PROXMOX_USER="myuser@pam"
+...
+...
+```
+
+And then execute the wrapper by executing the wrapper script:
+```bash
+./wrapper.sh
+```
+
+Per default the script assumes you have a file called `.env` in the same directoy as the wrapper script for your configuration. Also the patchmanagement script is assumed to be at the same location. However you can overwrite the paths by giving the cammandline arguments `-c` for the config and `-p` for the patchmanagement script. Any other arguments specified will output a message explaining the usage of the script.
+
 ## Restrictions
 
-The script assumes you have a working DNS setup. The script won't work with plain IPs as hosts in the inventory and support for that is not planned. However I'll gladly accept pull requests if you want to implement that.
+The script assumes you have a working DNS setup. The script won't work with plain IPs as hosts in the inventory and support for that is not planned. However I'll gladly accept pull requests if you want to implement that. To work around that, you could add entries for all managed VMs in `/etc/hosts` on the machine that executes the script.
+
+## Automating the execution
+
+As mentioned above, the script was developed for usage in a CI/CD pipeline. With this you can simply add all necessary variables to the pipelines environment by specifying them in your CI Config.
+
+To automate the execution without CI/CD, a cronjob would be your best option. Here the wrapper script should be the script to execute, since some implementations of cron don't support specification of environment veriables. However you could also place those in `/etc/environment`, but then the variables would be present for all users on the VM.
 
 ## Known issues
 
 Sometimes snapshot creation fails due to Proxmox closing the connection without an answer.
 I wasn't able to find out why that happens yet, but the script is smart enough to not patch a VM if the snapshot creation failed, so it won't break a VM by patching it without having a way to roll back the changes.
+
+## Possible future features
+
+### Config file
+
+I might implement sourcing the configuration from a file directly in the Python script in the future. This would be a neat addition in case the script is run manually, so you can omit the warpper script.
