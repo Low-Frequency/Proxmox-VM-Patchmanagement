@@ -7,8 +7,11 @@ This script manages automatic patching of VMs hosted on Proxmox. It supports Red
 If wanted, the script sends a Telegram notification after the patching process has been finished. It also prints out the whole process, as well as a summary at the end.
 
 The patching process looks like this:
-1. Collect the status (started or stopped) of all VMs, which have patching enabled
-1. Start all stopped VMs
+1. Get a summary of all VMs
+1. Determine if a VM has to be patched based on the tags
+1. Get the hostname of the VMs that have to be patched
+1. Build an inventory of VMs to be patched
+1. Start all stopped VMs which need to be patched
 1. Try to connect to the VM via SSH
     1. If the SSH connection is successful, delete the latest snapshot of the VM and create a new one
         * If the snapshot creation fails, skip patching
@@ -46,22 +49,19 @@ As per requirements on the managed VMs, the package `yum-utils` has to be instal
 
 ## Usage
 
-To use the script, you'll first have to create an inventory file. The file structure has to be as follows:
+To mark a VM for patching, you'll need to add tags to your VMs. The following tags will be respected:
 
-```yaml
-virtual_machines:
-  host:
-    patch: <true|false>
-    reboot: <true|false>
-```
+| Tag    | Function                                 |
+|--------|------------------------------------------|
+| patch  | Marks the VM to be patched by the script |
+| reboot | Enables the script to reboot the VM      |
 
-An example can be found [here](inventory.yml.example).
+No tags are required. The script will ignore all VMs that don't have the `patch` or `reboot` tag and will notify you that those VMs are marked for manual patching. VM Templates are always ignored.
 
-After creating the inventory file, multiple environment variables have to be set:
+Before you execute the script, you'll have to set some environment variables to configure it:
 
 | Variable            | Description                                                                           | Required                               | Default       |
 |---------------------|---------------------------------------------------------------------------------------|----------------------------------------|---------------|
-| INVENTORY_FILE      | Path to your inventory file                                                           | No                                     | inventory.yml |
 | PROXMOX_HOST        | FQDN of your Proxmox host                                                             | Yes                                    |               |
 | PROXMOX_USER        | The user which is used to connect to the Proxmox API                                  | Yes                                    |               |
 | PROXMOX_PASSWORD    | The password for the user                                                             | Yes                                    |               |
@@ -119,3 +119,8 @@ I wasn't able to find out why that happens yet, but the script is smart enough t
 ### Config file
 
 I might implement sourcing the configuration from a file directly in the Python script in the future. This would be a neat addition in case the script is run manually, so you can omit the warpper script.
+
+### Ansible integration
+
+A possible integration might be to use Ansible for updating instead of sending commands via SSH. This way the patching process would be more flexible, since you could write your own playbook to be executed instead of relying on the predefined commands.
+Also a second tag evaluation could make executing specific playbooks on a VM possible.

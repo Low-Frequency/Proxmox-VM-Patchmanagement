@@ -1,4 +1,3 @@
-pyyaml
 paramiko
 requests
 proxmoxer

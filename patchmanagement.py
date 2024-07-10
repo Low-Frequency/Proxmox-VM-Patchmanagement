@@ -10,7 +10,6 @@ down again.
 After the patching is done, a Telegram notification is sent.
 To configure the script, the following environment variables have to be set:
 
-INVENTORY_FILE      = Path to your inventory file
 PROXMOX_HOST        = FQDN of your Proxmox host
 PROXMOX_USER        = The user which is used to connect to the Proxmox API
 PROXMOX_PASSWORD    = The password for the user
@@ -24,13 +23,13 @@ TELEGRAM_BOT_TOKEN  = The authentication token of your Telegram bot
 TELEGRAM_CHAT_ID    = The channel identifier to send the message to
 POST_REQ_TIMEOUT    = Timeout for post requests. Defaults to 30 seconds
 ENABLE_PATCH_OUTPUT = Prints stdout of update command in pipeline
-DOMAIN              = Your domain. Is used to create the FQDN of the hosts to patch.
+DOMAIN              = Your domain
+                      Is used as a fallback, if qemu-guest-agent can't get the hostname
 """
 
 
 import os
 import time
-import yaml
 import paramiko
 import requests
 from proxmoxer import ProxmoxAPI
@@ -45,17 +44,14 @@ PROXMOX_VERIFY_SSL = os.getenv("PROXMOX_VERIFY_SSL", "false").lower() in (
     "t",
     "on",
     "yes",
-    "y"
+    "y",
 )
-
-# Inventory file with VMs to patch
-INVENTORY_FILE = os.getenv("INVENTORY_FILE", "inventory.yml")
 
 # SSH configuration
 SSH_USER = os.getenv("SSH_USER")
 SSH_KEY_FILE = os.getenv("SSH_KEY_FILE")
-SSH_TIMEOUT = int(os.getenv("SSH_TIMEOUT", "300"))
-SSH_RETRY_INTERVAL = int(os.getenv("SSH_RETRY_INTERVAL", "10"))
+SSH_TIMEOUT = int(os.getenv("SSH_TIMEOUT", "300"))  # Default to 300 seconds
+SSH_RETRY_INTERVAL = int(os.getenv("SSH_RETRY_INTERVAL", "10"))  # Default to 10 seconds
 
 # Telegram Configuration
 ENABLE_NOTIFICATION = os.getenv("ENABLE_NOTIFICATION", "True")
@@ -63,7 +59,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Request configuration
-POST_REQ_TIMEOUT = int(os.getenv("POST_REQ_TIMEOUT", "30"))
+POST_REQ_TIMEOUT = int(os.getenv("POST_REQ_TIMEOUT", "30"))  # Default to 30 seconds
 
 # Trigger to enable patch output
 ENABLE_PATCH_OUTPUT = os.getenv("ENABLE_PATCH_OUTPUT", "False")
@@ -93,7 +89,7 @@ stats = {
 
 
 class Style:
-    """ANSI color codes for output"""
+    """ANSI color codes for output styling"""
 
     RED = "\033[0;31m"
     GREEN = "\033[0;32m"
@@ -104,14 +100,8 @@ class Style:
     NC = "\033[0m"
 
 
-def convert_to_bool(value):
-    """Converts a given value to a boolean"""
-    value = value.lower()
-    return value in ("y", "yes", "t", "true", "on", "1")
-
-
 def check_requirements():
-    """This function checks if all required environment variables are set"""
+    """Checks if all requirements are satisfied"""
     if convert_to_bool(ENABLE_NOTIFICATION):
         return all(
             v is not None
@@ -139,50 +129,79 @@ def check_requirements():
     )
 
 
+def convert_to_bool(value):
+    """Convers a given value to a boolean based on known boolean representations"""
+    value = value.lower()
+    return value in ("y", "yes", "t", "true", "on", "1")
+
+
 def update_stats(stat, host, pkg=None):
-    """This function updates a single statistic"""
+    """Updates a single statistic in the stats map"""
     data = stats[stat]
-    if pkg is None:
-        data.append(host)
-    else:
+    if pkg is not None:
         data.append((host, pkg))
+    else:
+        data.append(host)
     stats[stat] = data
 
 
-def load_inventory(file_path):
-    """Function for opening the inventory file."""
-    with open(file_path, "r", encoding="utf-8") as file:
-        return yaml.safe_load(file)
-
-
-def get_vm_status():
-    """Function to get a list of the status of all VMs."""
-    vms = proxmox.nodes(node).qemu.get()
-    vm_status = {}
-    for vm in vms:
-        vm_status[vm["name"]] = {"id": vm["vmid"], "status": vm["status"]}
-    return vm_status
-
-
 def start_vm(vmid):
-    """Function to start a VM."""
+    """Starts a VM via the proxmox API"""
     print(f"Starting VM: {Style.BLUE}{vmid}{Style.NC}")
     proxmox.nodes(node).qemu(vmid).status().start.post(timeout=POST_REQ_TIMEOUT)
 
 
 def stop_vm(vmid):
-    """Function to stop a VM."""
+    """Stops a VM via the proxmox API"""
     print(f"Stopping VM: {Style.BLUE}{vmid}{Style.NC}")
     proxmox.nodes(node).qemu(vmid).status().shutdown.post(timeout=POST_REQ_TIMEOUT)
 
 
 def reboot_vm(vmid):
-    """Function to reboot a VM."""
+    """Reboots a VM via the proxmox API"""
     proxmox.nodes(node).qemu(vmid).status().reboot.post(timeout=POST_REQ_TIMEOUT)
 
 
+def get_hostname(vm):
+    """Gets the hostname for a VM.
+    Falls back to VM name and domain if no guest agent is enabled
+    """
+    config = proxmox.nodes(node).qemu(vm["vmid"]).config.get()
+    if config["agent"] == 1:
+        data = proxmox.nodes(node).qemu(vm["vmid"]).agent.get("get-host-name")
+        host = data["result"]["host-name"]
+    else:
+        host = f"{vm["name"]}.{DOMAIN}"
+    return host
+
+
+def get_vms():
+    """Gets the status of all VMs, their hostname, VM ID and the tags
+    Patching and rebooting is controlled via the tags.
+    If a predefined reboot and patch tag are found, the values in the map are set accordingly.
+    """
+    all_vms = proxmox.nodes(node).qemu.get()
+    vms = {}
+    for vm in all_vms:
+        if vm.get("template", 0) == 1:
+            continue
+        if "patch" not in vm.get("tags", []).split(";"):
+            update_stats("manual_patches", f"{vm["name"]}.{DOMAIN}")
+            continue
+        hostname = get_hostname(vm)
+        reboot = False
+        if "reboot" in vm.get("tags", []).split(";"):
+            reboot = True
+        vms[vm["vmid"]] = {
+            "hostname": hostname,
+            "status": vm["status"],
+            "reboot": reboot,
+        }
+    return vms
+
+
 def ssh_command(host, command):
-    """Function to execute a command via SSH."""
+    """Executes a given command on a host via SSH"""
     print(f"Connecting to Host: {Style.BLUE}{host}{Style.NC}")
     print(f"Executing command: {Style.PURPLE}{command}{Style.NC}")
     ssh = paramiko.SSHClient()
@@ -195,20 +214,22 @@ def ssh_command(host, command):
 
 
 def ssh_available(host):
-    """Function to check SSH availability."""
+    """Checks if SSH is available for a given host"""
     start_time = time.time()
     total_attempts = SSH_TIMEOUT // SSH_RETRY_INTERVAL
     attempt = 0
     while time.time() - start_time < SSH_TIMEOUT:
         attempt = attempt + 1
         try:
-            if total_attempts // 2 < attempt:
+            if total_attempts // 5 * 4 < attempt:
+                style = Style.RED
+            elif total_attempts // 2 < attempt:
                 style = Style.YELLOW
             else:
-                style = Style.NC
+                style = Style.GREEN
             print(
                 f"Attempting connection to {Style.BLUE}{host}{Style.NC}. "
-                f"{style}{attempt}{Style.NC}/{total_attempts} attempts."
+                f"{style}{attempt}/{total_attempts} attempts.{Style.NC}"
             )
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -228,9 +249,7 @@ def ssh_available(host):
 
 
 def set_update_command(host):
-    """This function is for automatically detecting the distribution.
-    This is done to set the correct update command
-    """
+    """Detects the package manager to use and sets the according update command"""
     command = "which dnf"
     exit_status, stdout, stderr = ssh_command(host, command)
     if stdout:
@@ -241,7 +260,7 @@ def set_update_command(host):
                 f"Setting package manager to {Style.PURPLE}{lines[0]}{Style.NC}"
             )
             distro = "redhat"
-            package_manager = f"sudo {lines[0]}"
+            package_manager = lines[0]
             update_command = "update -y"
             return distro, package_manager, update_command
     command = "which apt-get"
@@ -254,18 +273,18 @@ def set_update_command(host):
                 f"Setting package manager to {Style.PURPLE}{lines[0]}{Style.NC}"
             )
             distro = "debian"
-            package_manager = f"sudo {lines[0]}"
+            package_manager = lines[0]
             update_command = "upgrade -y"
             return distro, package_manager, update_command
     print(
         f"{Style.RED}Unsupported distro detected! "
         f"Could not set package manager!{Style.NC}"
     )
-    return "unsupported", "unsupported", "unsupported"
+    return None, None, None
 
 
 def count_updated_packages(output, distro):
-    """Function to count updated packages."""
+    """Counts the amount of packages which were updated"""
     lines = output.splitlines()
     if distro == "redhat":
         in_upgrade_section = False
@@ -375,7 +394,7 @@ def result_header(failed_vms, failed_snapshots, failed_patches):
         print(f"\n\n{Style.RED}Patchmanagement completed with errors{Style.NC}\n")
     else:
         header = "Patchmanagement completed successfully\n"
-        print(f"\n\{Style.GREEN}nPatchmanagement completed successfully{Style.NC}\n")
+        print(f"\n\n{Style.GREEN}Patchmanagement completed successfully{Style.NC}\n")
     return header
 
 
@@ -444,7 +463,7 @@ def patch_host(host, distro, package_manager, update_command):
     """Function to patch a host"""
     print(f"Starting patch for {Style.BLUE}{host}{Style.NC}...")
     if distro == "debian":
-        command = f"{package_manager} update -y"
+        command = f"sudo {package_manager} update -y"
         exit_status, stdout, stderr = ssh_command(host, command)
         if exit_status != 0:
             print(
@@ -453,7 +472,7 @@ def patch_host(host, distro, package_manager, update_command):
             )
             update_stats("failed_patches", host)
             return False
-    command = f"{package_manager} {update_command}"
+    command = f"sudo {package_manager} {update_command}"
     exit_status, stdout, stderr = ssh_command(host, command)
     if stdout:
         if convert_to_bool(ENABLE_PATCH_OUTPUT):
@@ -472,102 +491,90 @@ def patch_host(host, distro, package_manager, update_command):
     return False
 
 
-def reboot_host(vm, distro):
+def reboot_host(vmid, vm, distro):
     """Checks if a VM needs a reboot and restarts it"""
-    host = vm["hostname"]
-    vmid = vm["vmid"]
-    reboot = vm["reboot"]
-    print(f"Checking if reboot for {Style.BLUE}{host}{Style.NC} is necessary...")
+    print(
+        f"Checking if reboot for {Style.BLUE}{vm["hostname"]}{Style.NC} is necessary..."
+    )
     reboot_required = False
     if distro == "debian":
         command = "sudo ls -lah /var/run/reboot-required"
-        exit_status, stdout, stderr = ssh_command(host, command)
+        exit_status, stdout, stderr = ssh_command(vm["hostname"], command)
         if exit_status == 0:
             reboot_required = True
     elif distro == "redhat":
         command = "sudo needs-restarting -r"
-        exit_status, stdout, stderr = ssh_command(host, command)
+        exit_status, stdout, stderr = ssh_command(vm["hostname"], command)
         if exit_status == 1:
             reboot_required = True
     if reboot_required:
-        if reboot:
+        if vm["reboot"]:
             print(
-                f"{Style.YELLOW}Reboot required on {Style.BLUE}{host}{Style.NC}. Rebooting now..."
+                f"{Style.YELLOW}Reboot required on {Style.BLUE}{vm["hostname"]}{Style.NC}. "
+                f"Rebooting now..."
             )
             reboot_vm(vmid)
         else:
-            update_stats("needs_reboot", host)
+            update_stats("needs_reboot", vm["hostname"])
     else:
-        print(f"{Style.GREEN}No reboot required on {Style.BLUE}{host}{Style.NC}.")
-
-
-def patch_vm(vm):
-    """Patch a VM."""
-    host = vm["hostname"]
-    vmid = vm["vmid"]
-    reboot = vm["reboot"]
-    print(f"Waiting for SSH to become available on {host}...")
-    if ssh_available(host):
         print(
-            f"{Style.GREEN}SSH is available on {Style.BLUE}{host}{Style.NC}. "
+            f"{Style.GREEN}No reboot required on {Style.BLUE}{vm["hostname"]}{Style.NC}."
+        )
+
+
+def patch_vm(vm, vmid):
+    """Patch a VM."""
+    print(f"Waiting for SSH to become available on {vm["hostname"]}...")
+    if ssh_available(vm["hostname"]):
+        print(
+            f"{Style.GREEN}SSH is available on {Style.BLUE}{vm["hostname"]}{Style.NC}. "
             f"Looking for snapshot..."
         )
-        if manage_snapshots(vmid, host):
+        if manage_snapshots(vmid, vm["hostname"]):
             print(f"{Style.GREEN}Snapshot successfully created.{Style.NC}")
         else:
             print(
-                f"{Style.RED}Skipping patch for {Style.BLUE}{host}{Style.RED}!{Style.NC}"
+                f"{Style.RED}Skipping patch for {Style.BLUE}{vm["hostname"]}{Style.RED}!{Style.NC}"
             )
             return False
-        distro, package_manager, update_command = set_update_command(host)
-        if distro == "unsupported":
-            print(f"{Style.RED}Skipping patch for {Style.BLUE}{host}{Style.NC}")
-            update_stats("unsupported", host)
+        distro, package_manager, update_command = set_update_command(vm["hostname"])
+        if distro is None:
+            print(
+                f"{Style.RED}Skipping patch for {Style.BLUE}{vm["hostname"]}{Style.NC}"
+            )
+            update_stats("unsupported", vm["hostname"])
             return False
-        if patch_host(host, distro, package_manager, update_command):
-            reboot_host(vm, distro)
+        if patch_host(vm["hostname"], distro, package_manager, update_command):
+            reboot_host(vmid, vm, distro)
             return True
         return False
     print(
-        f"{Style.RED}SSH not available on {Style.BLUE}{host}{Style.RED} "
+        f"{Style.RED}SSH not available on {Style.BLUE}{vm["hostname"]}{Style.RED} "
         f"after {SSH_TIMEOUT} seconds!{Style.NC} Skipping patch."
     )
-    update_stats("ssh_failed_vms", host)
+    update_stats("ssh_failed_vms", vm["hostname"])
     return False
 
 
 def main():
     """Main function to patch all VMs."""
     check_requirements()
-    inventory = load_inventory(INVENTORY_FILE)
-    virtual_machines = inventory["virtual_machines"]
-    vm_status = get_vm_status()
+    vms = get_vms()
     initially_stopped_vms = []
-    for vm_name, patch_config in virtual_machines.items():
-        if patch_config["patch"]:
-            vmid = vm_status[vm_name]["id"]
-            if vm_status[vm_name]["status"] == "stopped":
-                start_vm(vmid)
-                initially_stopped_vms.append(vmid)
-    for vm_name, patch_config in virtual_machines.items():
-        vm = {
-            "vmid": vm_status[vm_name]["id"],
-            "hostname": f"{vm_name}.{DOMAIN}",
-            "reboot": patch_config["reboot"],
-        }
-        if patch_config["patch"]:
-            if patch_vm(vm):
-                print(
-                    f"{Style.GREEN}Patching of {Style.BLUE}{vm["hostname"]} "
-                    f"{Style.GREEN}complete{Style.NC}."
-                )
-            else:
-                print(
-                    f"{Style.RED}Patching of {Style.BLUE}{vm["hostname"]} "
-                    f"{Style.RED}failed!{Style.NC}"
-                )
+    for vmid, vm in vms.items():
+        if vm["status"] == "stopped":
+            start_vm(vmid)
+            initially_stopped_vms.append(vmid)
+        if patch_vm(vm, vmid):
+            print(
+                f"{Style.GREEN}Patching of {Style.BLUE}{vm["hostname"]} "
+                f"{Style.GREEN}complete{Style.NC}."
+            )
         else:
-            update_stats("manual_patches", vm["hostname"])
+            print(
+                f"{Style.RED}Patching of {Style.BLUE}{vm["hostname"]} "
+                f"{Style.RED}failed!{Style.NC}"
+            )
     for vmid in initially_stopped_vms:
         stop_vm(vmid)
     if convert_to_bool(ENABLE_NOTIFICATION):
